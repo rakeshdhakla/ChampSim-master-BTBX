@@ -1,0 +1,386 @@
+#include "ooo_cpu.h"
+#include <stack>
+#include <algorithm>
+#include <math.h>
+
+
+/**************************************** Basic Structures **************************************/
+
+// FTQ entry struct
+struct FTQEntry {
+  bool end_found;
+  uint64_t first_ip;
+  uint64_t last_ip;
+  FTQEntry (bool endFound, uint64_t firstIP, uint64_t lastIP) {
+	  end_found = endFound;
+	  first_ip = firstIP;
+	  last_ip = lastIP;
+  }
+};
+
+// BTB entry struct
+struct BTBEntry {
+  uint8_t branch_type; //2-bits (We only use four categories: conditional, call, return, and other.)
+  uint64_t tag;		   //16-bits
+  uint64_t target_ip;  //We use four different BTBs based of the number of bits required to encode branch target offset. This field can be 10-bits, 15-bits, 25-bits, or 64-bits.
+  BTBEntry( ) {}
+
+};
+
+struct BTB {
+	std::vector <std::vector<BTBEntry>> theBTB;
+	uint32_t numSets;
+	uint32_t assoc;
+	uint64_t indexMask;
+	uint32_t numIndexBits;
+
+    BTB( int32_t Sets, int32_t Assoc )
+      : numSets(Sets)
+        , assoc(Assoc) {
+          //aBTBSize must be a power of 2
+          assert( ((Sets - 1) & (Sets)) == 0);
+          theBTB.resize(Sets);
+          indexMask = Sets - 1;
+          numIndexBits = (uint32_t) log2((double)Sets);
+        }
+
+    int32_t index(uint64_t ip) {
+    	if (ip & 0x3) {
+    		return ((ip) & indexMask);
+    	} else {
+    		return ((ip >> 2) & indexMask);
+    	}
+    }
+
+    uint64_t get_tag(uint64_t ip) {
+    	uint64_t addr = ip;
+    	if (!(addr & 0x3)) {
+    		addr = addr >> 2;
+    	}
+    	addr = addr >> numIndexBits;
+    	/* We use a 16-bit tag.
+    	 * The lower 8-bits stay the same as in the full tag.
+    	 * The upper 8-bits are the folded X-OR of the remaining bits of the full tag.
+    	 */
+    	uint64_t tag = addr & 0xFF; //Set the lower 8-bits of the tag
+    	addr = addr >> 8;
+    	int tagMSBs = 0;
+    	/*Get the upper 8-bits (folded X-OR)*/
+    	for (int i = 0; i < 8; i++) {
+    		tagMSBs = tagMSBs ^ (addr & 0xFF);
+    		addr = addr >> 8;
+    	}
+    	/*Concatenate the lower and upper 8-bits of tag*/
+    	tag = tag | (tagMSBs << 8);
+    	return tag;
+    }
+
+    BTBEntry *get_BTBentry(uint64_t ip){
+    	BTBEntry *entry = NULL;
+
+    	int idx = index(ip);
+    	uint64_t tag = get_tag(ip);
+    	for (uint32_t i = 0; i < theBTB[idx].size(); i++) {
+    		if (theBTB[idx][i].tag == tag) {
+    			return &(theBTB[idx][i]);
+    		}
+    	}
+
+    	return entry;
+    }
+
+    void update_BTB(uint64_t ip, uint8_t b_type, uint64_t target){
+    	int idx = index(ip);
+    	uint64_t tag = get_tag(ip);
+    	int way = -1;
+    	for (uint32_t i = 0; i < theBTB[idx].size(); i++) {
+    		if (theBTB[idx][i].tag == tag) {
+    			way = i;
+    			break;
+    		}
+    	}
+
+    	if (way == -1) {
+    		BTBEntry entry;
+    		entry.tag = tag;
+    		entry.branch_type = b_type;
+    		entry.target_ip = target;
+
+    		if (theBTB[idx].size() >= assoc) {
+    			theBTB[idx].erase(theBTB[idx].begin());
+    		}
+    		theBTB[idx].push_back(entry);
+    	} else {
+    		BTBEntry entry = theBTB[idx][way];
+    		entry.branch_type = b_type;
+    		if (target != 0) {
+    			entry.target_ip = target;
+    		}
+
+    		//Update LRU
+    		theBTB[idx].erase(theBTB[idx].begin() + way);
+    		theBTB[idx].push_back(entry);
+    	}
+    }
+
+};
+
+
+#define MAX_BTB_LOOKUPs 19
+#define MAX_FTQ_ENTRIES 48
+#define MAX_PFETCHQ_ENTRIES 48
+#define MAX_RECENT_PFETCH 10
+#define MAX_RAS_ENTRIES 128
+
+
+uint64_t pfetch_ip = 0x0;
+uint64_t disp[66] = {0};
+
+/**************************************** Compoenets for prefetching **************************************/
+
+std::queue<FTQEntry> FTQ;				//Storage: 129-bits (FTQ-entry size) * 48 (number of FTQ entries) = 774 bytes
+std::deque<uint64_t> prefetch_queue;	//Storage: 64-bits * 48 (queue size) = 384 bytes
+std::deque<uint64_t> recent_prefetches;	//Storage: 64-bits * 10 (queue size) = 80 bytes
+
+std::stack<uint64_t> RAS;				//Storage: 64-bits * 128 (size) = 1KB
+std::stack<uint64_t> RAS_Pfetch;		//Storage: 64-bits * 128 (size) = 1KB
+
+
+BTB BTB_10D(1024, 8);					//Storage: (tag:16-bit, branch-type: 2-bit, target-offset: 10-bit) 28*1024*8 = 28KB
+BTB BTB_15D(1024, 7);					//Storage: (tag:16-bit, branch-type: 2-bit, target-offset: 15-bit) 33*1024*7 = 28.875KB
+BTB BTB_25D(1024, 8);					//Storage: (tag:16-bit, branch-type: 2-bit, target-offset: 25-bit) 43*1024*8 = 43KB
+BTB BTB_64D(256, 4);					//Storage: (tag:16-bit, branch-type: 2-bit,   full-target: 64-bit) 82*256*4  = 10.25KB
+
+
+
+/**************************************** Prefetcher Operation **************************************/
+
+
+
+void O3_CPU::l1i_prefetcher_initialize() 
+{
+
+}
+
+void O3_CPU::l1i_prefetcher_branch_operate(uint64_t ip, uint8_t branch_type, uint64_t branch_target)
+{
+	if (branch_target) {
+		/*Find the number of bits needed to encode the target offset*/
+		uint64_t target_offset;
+		if (branch_target > ip) {
+			target_offset = branch_target - ip;
+		} else {
+			target_offset = ip - branch_target;
+		}
+		int num_bits = (int)(log2((double)target_offset));
+		/* The cast "(int)log2" rounds down to lower integer, however we want to round it to upper integer, so add 1 to "num_bits"
+		 * As an offset can be both positive and negative, we need to add 1 sign bit to "num_bits".
+		 * */
+		num_bits += 2;
+		disp[num_bits]++;
+		assert(num_bits >= 0 && num_bits < 66);
+
+		/*Store (or update) the branch in one of the BTBs based on the number of bits required to encode the target offset*/
+		if (num_bits <= 10) {
+			BTB_10D.update_BTB(ip, branch_type, branch_target);
+		} else if (num_bits <= 15) {
+			BTB_15D.update_BTB(ip, branch_type, branch_target);
+		} else if (num_bits <= 25) {
+			BTB_25D.update_BTB(ip, branch_type, branch_target);
+		} else {
+			BTB_64D.update_BTB(ip, branch_type, branch_target);
+		}
+	}
+
+
+
+	/*Update the return address stack*/
+	if (branch_type == BRANCH_DIRECT_CALL || branch_type == BRANCH_INDIRECT_CALL) {
+		if (RAS.size() < MAX_RAS_ENTRIES) {
+			RAS.push(ip + 4);
+		}
+	} else if (branch_type == BRANCH_RETURN) {
+		if (RAS.size()) {
+			RAS.pop();
+		}
+	}
+
+	/*Check if the prefetch is on the correct execution path. If not, flush the FTQ.*/
+	if (FTQ.size()) {
+		if (!((ip) >= (FTQ.front().first_ip) && (ip) <= (FTQ.front().last_ip))) {
+			FTQ.pop();
+			if (!((ip) >= (FTQ.front().first_ip) && (ip) <= (FTQ.front().last_ip))) {
+				while (!FTQ.empty()) {
+					FTQ.pop();
+				}
+				prefetch_queue.clear();
+			}
+		} else if (FTQ.size() > 1) {
+			std::queue<FTQEntry> tempQ = FTQ;
+			tempQ.pop();
+			uint64_t next_pc = branch_target;
+			if (next_pc == 0) {
+				next_pc = ip + 4;
+			}
+			if (!((next_pc) >= (tempQ.front().first_ip) && (next_pc) <= (tempQ.front().last_ip))) {
+				while (!FTQ.empty()) {
+					FTQ.pop();
+				}
+				prefetch_queue.clear();
+			}
+		}
+	}
+
+	/*Reset the prefethcer if needed*/
+	if (pfetch_ip == 0 || FTQ.size() == 0) {
+		pfetch_ip = branch_target;
+		if (branch_target == 0)
+			pfetch_ip = ip + 4;
+
+		RAS_Pfetch = RAS;
+	}
+
+}
+
+void O3_CPU::l1i_prefetcher_cache_operate(uint64_t v_addr, uint8_t cache_hit, uint8_t prefetch_hit)
+{
+  if((cache_hit == 0) && (L1I.MSHR.occupancy < (L1I.MSHR.SIZE>>1)))
+    {
+      uint64_t pf_addr = v_addr + (1<<LOG2_BLOCK_SIZE);
+      prefetch_code_line(pf_addr);
+    }
+}
+
+void O3_CPU::l1i_prefetcher_cycle_operate()
+{
+	if (pfetch_ip && FTQ.size() < MAX_FTQ_ENTRIES) {
+
+		uint64_t first_address = pfetch_ip;
+		uint64_t last_address = 0;
+
+		/* As we don't know the instruction boundaries, lookup all the BTBs at byte granularity for a maximum of MAX_BTB_LOOKUPs addresses per cycle.
+		 * Stop on a BTB hit.
+		 * */
+		for (int i = 0; i < MAX_BTB_LOOKUPs; i++) {
+			BTBEntry *entry = BTB_10D.get_BTBentry(pfetch_ip);
+			if (entry == NULL) {
+				entry = BTB_15D.get_BTBentry(pfetch_ip);
+			}
+			if (entry == NULL) {
+				entry = BTB_25D.get_BTBentry(pfetch_ip);
+			}
+			if (entry == NULL) {
+				entry = BTB_64D.get_BTBentry(pfetch_ip);
+			}
+
+			/*If Add the byte address to FTQ and update the "pfetch_ip" for next lookup.*/
+			if (entry == NULL) {
+
+				if (FTQ.size() == 0 || FTQ.back().end_found) {
+					FTQ.push(FTQEntry(false, pfetch_ip, pfetch_ip));
+				} else {
+					FTQ.back().last_ip = pfetch_ip;
+				}
+
+				last_address = pfetch_ip;
+				pfetch_ip++;
+			} else {
+				uint64_t branch_ip, target_ip = 0;
+				branch_ip = pfetch_ip;
+				target_ip = entry->target_ip;
+
+				if (FTQ.size() == 0 || FTQ.back().end_found) {
+					FTQ.push(FTQEntry(true, pfetch_ip, branch_ip));
+				} else {
+					FTQ.back().end_found = true;
+					FTQ.back().last_ip = branch_ip;
+				}
+
+				/*Update "pfetch_ip" based on branch type and branch prediction*/
+				uint8_t branch_taken = true;
+				if (entry->branch_type == BRANCH_CONDITIONAL) {
+					branch_taken = predict_branch(branch_ip);
+					if (branch_taken) {
+						pfetch_ip = target_ip;
+					} else {
+						pfetch_ip = branch_ip + 1;
+					}
+				} else if (entry->branch_type == BRANCH_RETURN) {
+					if (RAS_Pfetch.size()) {
+						pfetch_ip = RAS_Pfetch.top();
+						RAS_Pfetch.pop();
+					} else {
+						pfetch_ip = target_ip;
+					}
+				} else if (entry->branch_type == BRANCH_DIRECT_CALL || entry->branch_type == BRANCH_INDIRECT_CALL) {
+					pfetch_ip = target_ip;
+					if (RAS_Pfetch.size() < MAX_RAS_ENTRIES) {
+						RAS_Pfetch.push(branch_ip + 1);
+					}
+				} else {
+					pfetch_ip = target_ip;
+				}
+
+				if (pfetch_ip == 0) {
+					pfetch_ip = branch_ip + 1;
+				}
+
+				last_address = branch_ip;
+
+				break;
+			}
+		}
+
+		/*Find prefetch candidates*/
+		  uint64_t firstBlock = first_address >> LOG2_BLOCK_SIZE;
+		  uint64_t lastBlock = last_address >> LOG2_BLOCK_SIZE;
+		  int numCacheBlocks = 1 + (lastBlock - firstBlock);
+		  if (numCacheBlocks > 5) //Prefetch throttle.
+		  	numCacheBlocks = 5;
+
+		  for (int i = 0; i < numCacheBlocks; i++) {
+			  uint64_t pfetch_addr = (firstBlock + i) << LOG2_BLOCK_SIZE;
+
+			  bool is_recently_prefetched = false;
+			  std::deque<uint64_t>::iterator it = std::find(prefetch_queue.begin(), prefetch_queue.end(), pfetch_addr);
+			  if (it == prefetch_queue.end()) {
+			  		it = std::find(recent_prefetches.begin(), recent_prefetches.end(), pfetch_addr);
+			  		if (it != recent_prefetches.end()) {
+						is_recently_prefetched = true;
+			  		}
+			  } else {
+			  		is_recently_prefetched = true;
+			  }
+
+			  if (is_recently_prefetched == false && prefetch_queue.size() < MAX_PFETCHQ_ENTRIES) {
+					  prefetch_queue.push_back(pfetch_addr);
+			  }
+		  }
+
+		  /*Issue prefetches*/
+
+			if (prefetch_queue.size() && L1I.MSHR.occupancy < (L1I.MSHR.SIZE>>1) && L1I.PQ.occupancy < L1I.PQ.SIZE) {
+				prefetch_code_line(prefetch_queue.front());
+			  	recent_prefetches.push_back(prefetch_queue.front());
+			  	if (recent_prefetches.size() > MAX_RECENT_PFETCH) {
+			  		recent_prefetches.pop_front();
+			  	}
+
+			  	prefetch_queue.pop_front();
+			}
+	}
+
+}
+
+void O3_CPU::l1i_prefetcher_cache_fill(uint64_t v_addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_v_addr)
+{
+
+}
+
+void O3_CPU::l1i_prefetcher_final_stats()
+{
+	for(int i = 0; i < 66; i++) {
+		cout << "XXX disp-" << i << " " << disp[i] << endl;
+	}
+
+}

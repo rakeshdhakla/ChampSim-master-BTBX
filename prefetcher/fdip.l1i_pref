@@ -1,0 +1,165 @@
+#include "ooo_cpu.h"
+#include <stack>
+#include <algorithm>
+#include <math.h>
+
+
+/**************************************** Basic Structures **************************************/
+
+#define MAX_PFETCHQ_ENTRIES 48
+#define MAX_RECENT_PFETCH 10
+
+
+/**************************************** Compoenets for prefetching **************************************/
+
+std::deque<uint64_t> prefetch_queue;	//Storage: 64-bits * 48 (queue size) = 384 bytes
+std::deque<uint64_t> prefetch_queue_spec;	//Storage: 64-bits * 48 (queue size) = 384 bytes
+std::deque<uint64_t> recent_prefetches;	//Storage: 64-bits * 10 (queue size) = 80 bytes
+uint64_t disp[66] = {0};
+uint64_t lowBits[66] = {0};
+
+/**************************************** Prefetcher Operation **************************************/
+
+
+
+void O3_CPU::l1i_prefetcher_initialize() 
+{
+
+}
+
+void O3_CPU::l1i_prefetcher_instruction_operate(uint64_t ip)
+{
+	prefetch_queue_spec.clear();
+	uint64_t block_addr = ((ip >> LOG2_BLOCK_SIZE) << LOG2_BLOCK_SIZE);
+        if (block_addr == 0)
+                return;
+
+	std::deque<uint64_t>::iterator it = std::find(prefetch_queue.begin(), prefetch_queue.end(), block_addr);
+	if (it == prefetch_queue.end()) {
+		std::deque<uint64_t>::iterator it1 = std::find(recent_prefetches.begin(), recent_prefetches.end(), block_addr);
+		if (it1 == recent_prefetches.end()) {
+			prefetch_queue.push_back(block_addr);
+		}
+	}
+}
+
+void O3_CPU::l1i_prefetcher_instruction_spec_operate(uint64_t ip)
+{
+	uint64_t block_addr = ((ip >> LOG2_BLOCK_SIZE) << LOG2_BLOCK_SIZE);
+	if (block_addr == 0)
+		return;
+
+	std::deque<uint64_t>::iterator it = std::find(prefetch_queue.begin(), prefetch_queue.end(), block_addr);
+	if (it == prefetch_queue.end()) {
+		std::deque<uint64_t>::iterator it1 = std::find(recent_prefetches.begin(), recent_prefetches.end(), block_addr);
+		if (it1 == recent_prefetches.end()) {
+			std::deque<uint64_t>::iterator it2 = std::find(prefetch_queue_spec.begin(), prefetch_queue_spec.end(), block_addr);
+			if (it2 == prefetch_queue_spec.end()) {
+				prefetch_queue_spec.push_back(block_addr);
+			}
+		}
+	}
+}
+
+void O3_CPU::l1i_prefetcher_branch_operate(uint64_t ip, uint8_t branch_type, uint64_t branch_target)
+{
+        if (branch_target && branch_type != BRANCH_RETURN) {
+                /*Find the number of bits needed to encode the target offset*/
+                uint64_t target_offset; 
+                if (branch_target > ip) {
+                        target_offset = branch_target - ip;
+                } else {
+                        target_offset = ip - branch_target;
+                }
+
+		int num_bits = 0;
+	        if (target_offset) {
+                	num_bits = (int)(log2((double)target_offset));
+                	/* The cast "(int)log2" rounds down to lower integer, however we want to round it to upper integer, so add 1 to "num_bits"
+                 	* As an offset can be both positive and negative, we need to add 1 sign bit to "num_bits".
+                 	* */
+		}
+
+                //num_bits += 2; //Not needed if the distance/displacement is in 4 byte instructions instead of bytes
+
+/**********************************************************************************************************************/
+                uint64_t diff_bits = (branch_target >> 2) ^ (ip >> 2);
+                int num_lower_bits = 0;
+                while (diff_bits != 0) {
+                        diff_bits = diff_bits >> 1;
+                        num_lower_bits++;
+                }
+                //cout << "Target " << hex << branch_target << " ip " << ip << " num_bits " << dec << num_bits << " num_lower_bits " << num_lower_bits << endl;
+
+                if ((num_bits - 3) > num_lower_bits) {
+			cout << "Target " << hex << branch_target << " ip " << ip << " num_bits " << dec << num_bits << " num_lower_bits " << num_lower_bits << endl;
+                        cout << "This is wierd" << endl;
+                        assert(0);
+                }
+
+/*********************************************************************************************************************/
+		//if (branch_type != BRANCH_RETURN) {
+                    disp[num_bits]++;
+		    lowBits[num_lower_bits]++;
+		//}
+                assert(num_bits >= 0 && num_bits < 66);
+
+        }
+	if (branch_type == BRANCH_RETURN) {
+		    disp[0]++;
+                    lowBits[0]++;
+	}
+}
+
+void O3_CPU::l1i_prefetcher_cache_operate(uint64_t v_addr, uint8_t cache_hit, uint8_t prefetch_hit)
+{
+  if((cache_hit == 0) && (L1I.MSHR.occupancy < (L1I.MSHR.SIZE>>1)))
+    {
+      uint64_t pf_addr = v_addr + (1<<LOG2_BLOCK_SIZE);
+      prefetch_code_line(pf_addr);
+    }
+}
+
+void O3_CPU::l1i_prefetcher_cycle_operate()
+{
+
+	/*Issue prefetches*/
+
+	if (prefetch_queue.size()) {
+		if (L1I.MSHR.occupancy < (L1I.MSHR.SIZE>>1) && L1I.PQ.occupancy < L1I.PQ.SIZE) {
+			prefetch_code_line(prefetch_queue.front());
+			recent_prefetches.push_back(prefetch_queue.front());
+			if (recent_prefetches.size() > MAX_RECENT_PFETCH) {
+				recent_prefetches.pop_front();
+			}
+	
+			prefetch_queue.pop_front();
+		}
+	} else if (prefetch_queue_spec.size()) {
+			if (L1I.MSHR.occupancy < (L1I.MSHR.SIZE>>1) && L1I.PQ.occupancy < L1I.PQ.SIZE) {
+			prefetch_code_line(prefetch_queue_spec.front());
+			recent_prefetches.push_back(prefetch_queue_spec.front());
+			if (recent_prefetches.size() > MAX_RECENT_PFETCH) {
+				recent_prefetches.pop_front();
+			}
+	
+			prefetch_queue_spec.pop_front();
+		}
+	}	
+}
+
+void O3_CPU::l1i_prefetcher_cache_fill(uint64_t v_addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_v_addr)
+{
+
+}
+
+void O3_CPU::l1i_prefetcher_final_stats()
+{
+        for(int i = 0; i < 66; i++) {
+                cout << "XXX disp-" << i << " " << disp[i] << endl;
+        }
+
+        for(int i = 0; i < 66; i++) {
+                cout << "XXX diffBits-" << i << " " << lowBits[i] << endl;
+        }
+}

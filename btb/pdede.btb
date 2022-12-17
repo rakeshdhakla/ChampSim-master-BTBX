@@ -1,0 +1,440 @@
+
+/*
+ * This file implements a basic Branch Target Buffer (BTB) structure.
+ * It uses a set-associative BTB to predict the targets of non-return branches,
+ * and it uses a small Return Address Stack (RAS) to predict the target of
+ * returns.
+ */
+
+#include "ooo_cpu.h"
+
+#define BASIC_BTB_SETS 512
+#define BASIC_BTB_WAYS 6
+#define BASIC_BTB_INDIRECT_SIZE 4096
+#define BASIC_BTB_RAS_SIZE 64
+#define BASIC_BTB_CALL_INSTR_SIZE_TRACKERS 1024
+
+#define BASIC_BTB1_SETS 128
+#define BASIC_BTB1_WAYS 1
+
+#define NUM_PAGEBTB_SETS 32
+#define NUM_PAGEBTB_WAYS 16
+#define NUM_REGIONBTB_ENTRIES 4
+
+struct BASIC_BTB_ENTRY {
+  uint64_t ip_tag;
+  uint64_t target;
+  uint64_t target_offset;
+  uint64_t pageBTB_set_index;
+  uint64_t pageBTB_way_index;
+  uint64_t regionBTB_index;
+  uint8_t same_page_target;
+  uint8_t always_taken;
+  uint8_t branch_type;
+  uint64_t lru;
+};
+
+BASIC_BTB_ENTRY basic_btb[NUM_CPUS][BASIC_BTB_SETS][BASIC_BTB_WAYS];
+BASIC_BTB_ENTRY basic_btb1[NUM_CPUS][BASIC_BTB1_SETS][BASIC_BTB1_WAYS];
+uint64_t basic_btb_lru_counter[NUM_CPUS];
+
+uint64_t pageBTB[NUM_PAGEBTB_SETS][NUM_PAGEBTB_WAYS] = {0};
+std::vector <uint64_t> pageBTB_lru [NUM_PAGEBTB_SETS];
+uint64_t regionBTB[NUM_REGIONBTB_ENTRIES] = {0};
+std::vector <uint64_t> regionBTB_lru (NUM_REGIONBTB_ENTRIES);
+
+uint64_t basic_btb_indirect[NUM_CPUS][BASIC_BTB_INDIRECT_SIZE];
+uint64_t basic_btb_conditional_history[NUM_CPUS];
+
+uint64_t basic_btb_ras[NUM_CPUS][BASIC_BTB_RAS_SIZE];
+int basic_btb_ras_index[NUM_CPUS];
+/*
+ * The following two variables are used to automatically identify the
+ * size of call instructions, in bytes, which tells us the appropriate
+ * target for a call's corresponding return.
+ * They exist because ChampSim does not model a specific ISA, and
+ * different ISAs could use different sizes for call instructions,
+ * and even within the same ISA, calls can have different sizes.
+ */
+uint64_t basic_btb_call_instr_sizes[NUM_CPUS][BASIC_BTB_CALL_INSTR_SIZE_TRACKERS];
+
+uint64_t get_pageBTBIndex (uint64_t pageNumber, uint64_t &PageBTB_writes) {
+	int idx = pageNumber & (NUM_PAGEBTB_SETS - 1);
+	for (int i = 0; i < NUM_PAGEBTB_WAYS; i++) {
+		if (pageNumber == pageBTB[idx][i]) {
+			return i;
+		}
+	}
+
+	//Could not find the pageNumber in pageBTB, allocate a new entry
+	PageBTB_writes++;
+	uint64_t repEntry = pageBTB_lru[idx][0];
+	pageBTB[idx][repEntry] = pageNumber;
+	pageBTB_lru[idx].erase(pageBTB_lru[idx].begin());
+	pageBTB_lru[idx].push_back(repEntry);
+	return repEntry;
+}
+
+uint64_t get_regionBTBIndex (uint64_t regionNumber, uint64_t &RegionBTB_writes) {
+	for (int i = 0; i < NUM_REGIONBTB_ENTRIES; i++) {
+		if (regionNumber == regionBTB[i]) {
+			return i;
+		}
+	}
+
+	//Could not find the regionNumber in regionBTB, allocate a new entry
+	RegionBTB_writes++;
+	uint64_t repEntry = regionBTB_lru[0];
+	regionBTB[repEntry] = regionNumber;
+	regionBTB_lru.erase(regionBTB_lru.begin());
+	regionBTB_lru.push_back(repEntry);
+	return repEntry;
+}
+
+void update_pageBTB_lru (uint64_t set, uint64_t pageBTB_way_index) {
+	for (int i = 0; i < NUM_PAGEBTB_WAYS; i++) {
+		if (pageBTB_way_index == pageBTB_lru[set][i]) {
+			pageBTB_lru[set].erase(pageBTB_lru[set].begin() + i);
+			pageBTB_lru[set].push_back(pageBTB_way_index);
+			return;
+		}
+	}
+	assert(0);
+}
+
+void update_regionBTB_lru (uint64_t regionBTB_index) {
+	for (int i = 0; i < NUM_REGIONBTB_ENTRIES; i++) {
+		if (regionBTB_index == regionBTB_lru[i]) {
+			regionBTB_lru.erase(regionBTB_lru.begin() + i);
+			regionBTB_lru.push_back(regionBTB_index);
+			return;
+		}
+	}
+	assert(0);
+}
+
+uint64_t basic_btb_abs_addr_dist(uint64_t addr1, uint64_t addr2) {
+  if(addr1 > addr2) {
+    return addr1 - addr2;
+  }
+
+  return addr2 - addr1;
+}
+
+uint64_t basic_btb_set_index(uint64_t ip) { return ((ip >> 2) & (BASIC_BTB_SETS-1)); }
+
+BASIC_BTB_ENTRY *basic_btb_find_entry(uint8_t cpu, uint64_t ip) {
+  uint64_t set = basic_btb_set_index(ip);
+  for (uint32_t i = 0; i < BASIC_BTB_WAYS; i++) {
+    if (basic_btb[cpu][set][i].ip_tag == ip) {
+      return &(basic_btb[cpu][set][i]);
+    }
+  }
+
+  set = ((ip >> 2) & (BASIC_BTB1_SETS-1));
+  for (uint32_t i = 0; i < BASIC_BTB1_WAYS; i++) {
+    if (basic_btb1[cpu][set][i].ip_tag == ip) {
+      return &(basic_btb1[cpu][set][i]);
+    }
+  }
+
+  return NULL;
+}
+
+BASIC_BTB_ENTRY *basic_btb_get_lru_entry(uint8_t cpu, uint64_t ip, uint8_t differentPageTarget) {
+  uint64_t set = basic_btb_set_index(ip);
+  uint32_t lru_way = 0;
+  uint64_t lru_value = basic_btb[cpu][set][lru_way].lru;
+  uint32_t waysToCheck = differentPageTarget ? BASIC_BTB_WAYS/2 : BASIC_BTB_WAYS;
+  for (uint32_t i = 0; i < waysToCheck; i++) {
+    if (basic_btb[cpu][set][i].lru < lru_value) {
+      lru_way = i;
+      lru_value = basic_btb[cpu][set][lru_way].lru;
+    }
+  }
+  
+    
+  uint64_t set1 = ((ip >> 2) & (BASIC_BTB1_SETS-1));
+  uint32_t lru_way1 = 0;
+  uint64_t lru_value1 = basic_btb1[cpu][set1][lru_way1].lru;
+  waysToCheck = differentPageTarget ? BASIC_BTB1_WAYS/2 : BASIC_BTB1_WAYS;
+  for (uint32_t i = 0; i < waysToCheck; i++) {
+    if (basic_btb1[cpu][set1][i].lru < lru_value1) {
+      lru_way1 = i;
+      lru_value1 = basic_btb1[cpu][set1][lru_way1].lru;
+    }
+  }
+
+  if (lru_value1 > lru_value)
+  	return &(basic_btb[cpu][set][lru_way]);
+  else 
+	return &(basic_btb1[cpu][set1][lru_way1]);  
+}
+
+void basic_btb_update_lru(uint8_t cpu, BASIC_BTB_ENTRY *btb_entry) {
+  btb_entry->lru = basic_btb_lru_counter[cpu];
+  basic_btb_lru_counter[cpu]++;
+}
+
+uint64_t basic_btb_indirect_hash(uint8_t cpu, uint64_t ip) {
+  uint64_t hash = (ip >> 2) ^ (basic_btb_conditional_history[cpu]);
+  return (hash & (BASIC_BTB_INDIRECT_SIZE-1));
+}
+
+void push_basic_btb_ras(uint8_t cpu, uint64_t ip) {
+  basic_btb_ras_index[cpu]++;
+  if (basic_btb_ras_index[cpu] == BASIC_BTB_RAS_SIZE) {
+    basic_btb_ras_index[cpu] = 0;
+  }
+
+  basic_btb_ras[cpu][basic_btb_ras_index[cpu]] = ip;
+}
+
+uint64_t peek_basic_btb_ras(uint8_t cpu) {
+  return basic_btb_ras[cpu][basic_btb_ras_index[cpu]];
+}
+
+uint64_t pop_basic_btb_ras(uint8_t cpu) {
+  uint64_t target = basic_btb_ras[cpu][basic_btb_ras_index[cpu]];
+  basic_btb_ras[cpu][basic_btb_ras_index[cpu]] = 0;
+
+  basic_btb_ras_index[cpu]--;
+  if (basic_btb_ras_index[cpu] == -1) {
+    basic_btb_ras_index[cpu] += BASIC_BTB_RAS_SIZE;
+  }
+
+  return target;
+}
+
+uint64_t basic_btb_call_size_tracker_hash(uint64_t ip) {
+  return (ip & (BASIC_BTB_CALL_INSTR_SIZE_TRACKERS-1));
+}
+
+uint64_t basic_btb_get_call_size(uint8_t cpu, uint64_t ip) {
+  uint64_t size = basic_btb_call_instr_sizes[cpu][basic_btb_call_size_tracker_hash(ip)];
+
+  return size;
+}
+
+void O3_CPU::initialize_btb() {
+  std::cout << "Basic BTB sets: " << BASIC_BTB_SETS
+            << " ways: " << BASIC_BTB_WAYS
+            << " indirect buffer size: " << BASIC_BTB_INDIRECT_SIZE
+            << " RAS size: " << BASIC_BTB_RAS_SIZE << std::endl;
+
+  for (uint32_t i = 0; i < BASIC_BTB_SETS; i++) {
+    for (uint32_t j = 0; j < BASIC_BTB_WAYS; j++) {
+      basic_btb[cpu][i][j].ip_tag = 0;
+      basic_btb[cpu][i][j].target = 0;
+      basic_btb[cpu][i][j].target_offset = 0;
+      basic_btb[cpu][i][j].pageBTB_set_index = 0;
+      basic_btb[cpu][i][j].pageBTB_way_index = 0;
+      basic_btb[cpu][i][j].regionBTB_index = 0;
+      basic_btb[cpu][i][j].same_page_target = 1;
+      basic_btb[cpu][i][j].always_taken = 0;
+      basic_btb[cpu][i][j].branch_type = NOT_BRANCH;
+      basic_btb[cpu][i][j].lru = 0;
+    }
+  }
+
+  for (uint32_t i = 0; i < BASIC_BTB1_SETS; i++) {
+    for (uint32_t j = 0; j < BASIC_BTB1_WAYS; j++) {
+      basic_btb1[cpu][i][j].ip_tag = 0;
+      basic_btb1[cpu][i][j].target = 0;
+      basic_btb1[cpu][i][j].target_offset = 0;
+      basic_btb1[cpu][i][j].pageBTB_set_index = 0;
+      basic_btb1[cpu][i][j].pageBTB_way_index = 0;
+      basic_btb1[cpu][i][j].regionBTB_index = 0;
+      basic_btb1[cpu][i][j].same_page_target = 1;
+      basic_btb1[cpu][i][j].always_taken = 0;
+      basic_btb1[cpu][i][j].branch_type = NOT_BRANCH;
+      basic_btb1[cpu][i][j].lru = 0;
+    }
+  }
+
+  basic_btb_lru_counter[cpu] = 0;
+
+  for (int i = 0; i < NUM_PAGEBTB_SETS; i++) {
+	  pageBTB_lru[i].resize(NUM_PAGEBTB_WAYS);
+	  for (int j = 0; j < NUM_PAGEBTB_WAYS; j++) {
+		  pageBTB_lru[i][j] = j;
+	  }
+  }
+
+  for (int i = 0; i < NUM_REGIONBTB_ENTRIES; i++) {
+	  regionBTB_lru[i] = i;
+  }
+
+  for (uint32_t i = 0; i < BASIC_BTB_INDIRECT_SIZE; i++) {
+    basic_btb_indirect[cpu][i] = 0;
+  }
+  basic_btb_conditional_history[cpu] = 0;
+
+  for (uint32_t i = 0; i < BASIC_BTB_RAS_SIZE; i++) {
+    basic_btb_ras[cpu][i] = 0;
+  }
+  basic_btb_ras_index[cpu] = 0;
+  for (uint32_t i=0; i<BASIC_BTB_CALL_INSTR_SIZE_TRACKERS; i++) {
+    basic_btb_call_instr_sizes[cpu][i] = 4;
+  }
+}
+
+BTB_outcome O3_CPU::btb_prediction(uint64_t ip, uint8_t branch_type) {
+  auto btb_entry = basic_btb_find_entry(cpu, ip);
+
+  if (btb_entry == NULL) {
+    // no prediction for this IP
+      if (branch_type == BRANCH_DIRECT_CALL || branch_type == BRANCH_INDIRECT_CALL) {
+          push_basic_btb_ras(cpu, ip);
+      }
+
+	  BTB_outcome outcome = {0, BRANCH_CONDITIONAL, 2};
+	  return outcome;
+//      return std::make_pair(0, 0);
+  }
+
+  basic_btb_update_lru(cpu, btb_entry);
+  branch_type = NOT_BRANCH;
+  branch_type = btb_entry->branch_type;
+
+//  uint8_t always_taken = false;
+//  if (branch_type != BRANCH_CONDITIONAL) {
+//    always_taken = true;
+//  }
+
+  if ((branch_type == BRANCH_DIRECT_CALL) ||
+      (branch_type == BRANCH_INDIRECT_CALL)) {
+    // add something to the RAS
+    push_basic_btb_ras(cpu, ip);
+  }
+
+  if (branch_type == BRANCH_RETURN) {
+    // peek at the top of the RAS
+    uint64_t target = peek_basic_btb_ras(cpu);
+    // and adjust for the size of the call instr
+    target += basic_btb_get_call_size(cpu, target);
+
+    BTB_outcome outcome = {target, BRANCH_RETURN, 0};
+    return outcome;
+//    return std::make_pair(target, always_taken);
+  } /*else if ((branch_type == BRANCH_INDIRECT) ||
+             (branch_type == BRANCH_INDIRECT_CALL)) {
+    return std::make_pair(basic_btb_indirect[cpu][basic_btb_indirect_hash(cpu, ip)], always_taken);
+  } */else {
+
+	  uint64_t target = 0;
+	  if (btb_entry->same_page_target) {
+		  target = (ip & 0xFFFFFFFFFFFFF000) | btb_entry->target_offset;
+		  if (target != btb_entry->target) {
+			  cout << "ip " << hex << ip << " Assembled target " << target << " stored target " << btb_entry->target << endl;
+			  assert(0);
+		  }
+	  } else {
+		  uint64_t pageNumber = pageBTB[btb_entry->pageBTB_set_index][btb_entry->pageBTB_way_index];
+		  uint64_t regionNumber = regionBTB[btb_entry->regionBTB_index];
+		  target = (regionNumber << 28) | (pageNumber << 12) | btb_entry->target_offset;
+		  update_pageBTB_lru(btb_entry->pageBTB_set_index, btb_entry->pageBTB_way_index);
+		  update_regionBTB_lru(btb_entry->regionBTB_index);
+		  
+		  PageBTB_reads++;
+		  RegionBTB_reads++;
+	  }
+	  BTB_outcome outcome = {target, branch_type, !(btb_entry->same_page_target)};
+	  return outcome;
+
+//    return std::make_pair(/*btb_entry->*/target, always_taken);
+  }
+
+  assert(0);
+//  return std::make_pair(0, always_taken);
+}
+
+void O3_CPU::update_btb(uint64_t ip, uint64_t branch_target, uint8_t taken,
+                        uint8_t branch_type) {
+  // updates for indirect branches
+  /*if ((branch_type == BRANCH_INDIRECT) ||
+      (branch_type == BRANCH_INDIRECT_CALL)) {
+    basic_btb_indirect[cpu][basic_btb_indirect_hash(cpu, ip)] = branch_target;
+  }
+  if (branch_type == BRANCH_CONDITIONAL) {
+    basic_btb_conditional_history[cpu] <<= 1;
+    if (taken) {
+      basic_btb_conditional_history[cpu] |= 1;
+    }
+  }*/
+
+  if (branch_type == BRANCH_RETURN) {
+    // recalibrate call-return offset
+    // if our return prediction got us into the right ball park, but not the
+    // exactly correct byte target, then adjust our call instr size tracker
+    uint64_t call_ip = pop_basic_btb_ras(cpu);
+    uint64_t estimated_call_instr_size = basic_btb_abs_addr_dist(call_ip, branch_target);
+    if (estimated_call_instr_size <= 10) {
+      basic_btb_call_instr_sizes[cpu][basic_btb_call_size_tracker_hash(call_ip)] = estimated_call_instr_size;
+    }
+  } 
+
+  // use BTB
+  auto btb_entry = basic_btb_find_entry(cpu, ip);
+
+  uint8_t differentPageTarget = ((ip >> 12) ^ (branch_target >>12)) ? 1 : 0;
+  if (branch_type == BRANCH_RETURN)
+	  differentPageTarget = 0;
+
+  if (btb_entry == NULL) {
+    if ((branch_target != 0) && taken) {
+      
+      BTB_writes++;
+      
+      // no prediction for this entry so far, so allocate one
+      //uint64_t set = basic_btb_set_index(ip);
+
+      auto repl_entry = basic_btb_get_lru_entry(cpu, ip, differentPageTarget);
+
+      repl_entry->ip_tag = ip;
+      repl_entry->target = branch_target;
+
+      repl_entry->target_offset = branch_target & 0xFFF;
+
+      if (differentPageTarget) {
+		  uint64_t pageNumber = (branch_target >> 12) & 0xFFFF;
+		  uint64_t regionNumber = branch_target >> 28;
+		  repl_entry->pageBTB_set_index = pageNumber & (NUM_PAGEBTB_SETS - 1);
+		  repl_entry->pageBTB_way_index = get_pageBTBIndex(pageNumber, PageBTB_writes);
+		  repl_entry->regionBTB_index = get_regionBTBIndex(regionNumber, RegionBTB_writes);
+		  repl_entry->same_page_target = 0;
+		  PageBTB_readsBeforeWrite++;
+		  RegionBTB_readsBeforeWrite++;
+      } else {
+    	  repl_entry->same_page_target = 1;
+      }
+
+      repl_entry->always_taken = 1;
+      repl_entry->branch_type = branch_type;
+      basic_btb_update_lru(cpu, repl_entry);
+    }
+  } else {
+    // update an existing entry
+	  if (branch_target != 0) {
+		btb_entry->target = branch_target;
+
+		btb_entry->target_offset = branch_target & 0xFFF;
+
+		if (differentPageTarget) {
+			uint64_t pageNumber = (branch_target >> 12) & 0xFFFF;
+			uint64_t regionNumber = branch_target >> 28;
+			btb_entry->pageBTB_set_index = pageNumber & (NUM_PAGEBTB_SETS - 1);
+			btb_entry->pageBTB_way_index = get_pageBTBIndex(pageNumber, PageBTB_writes);
+			btb_entry->regionBTB_index = get_regionBTBIndex(regionNumber, RegionBTB_writes);
+			btb_entry->same_page_target = 0;
+		} else {
+			btb_entry->same_page_target = 1;
+		}
+
+		if (!taken) {
+		  btb_entry->always_taken = 0;
+		}
+	  }
+  }
+  
+}
