@@ -32,7 +32,8 @@ Use the following commands to compile the code:
 
 # Download IPC-1 trace
 
-The traces can also be downloaded from https://drive.google.com/file/d/1qs8t8-YWc7lLoYbjbH_d3lf1xdoYBznf/view?usp=sharing
+The traces can be downloaded from https://drive.google.com/file/d/1qs8t8-YWc7lLoYbjbH_d3lf1xdoYBznf/view?usp=sharing
+
 Once downloaded, place them in “<Path_to_code>/dpc3_traces/” directory.
 
 # Generating configuration files
